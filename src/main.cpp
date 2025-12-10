@@ -29,6 +29,9 @@ String savedWifiPassword = "";
 // Bed side setting (true = right, false = left)
 bool bedSideRight = false;  // Default to left side
 
+// Temperature unit setting (true = Fahrenheit, false = Celsius)
+bool useFahrenheit = false;  // Default to Celsius
+
 // FreeSleep power state (true = on, false = off)
 bool bedPowerOn = true;      // Assume on until we fetch status
 bool pillowPowerOn = true;   // Assume on until we fetch status
@@ -49,6 +52,7 @@ enum MenuItem {
     MENU_BED_IP,
     MENU_PILLOW_IP,
     MENU_BED_SIDE,
+    MENU_TEMP_UNIT,
     MENU_NIGHT_MODE,
     MENU_TEMPERATURE_MODE,
     MENU_COUNT  // Total number of menu items
@@ -178,6 +182,10 @@ void setup() {
     // Load bed side setting
     bedSideRight = preferences.getBool("bedSideRight", false);
     Serial.printf("Loaded bed side: %s\n", bedSideRight ? "Right" : "Left");
+
+    // Load temperature unit setting
+    useFahrenheit = preferences.getBool("useFahrenheit", false);
+    Serial.printf("Loaded temp unit: %s\n", useFahrenheit ? "Fahrenheit" : "Celsius");
 
     // Initialize display
     M5Dial.Display.setRotation(0);
@@ -584,37 +592,62 @@ void handleEncoderInput() {
     // Calculate difference from last update
     long diff = newPosition - lastEncoderPosition;
 
+    // Accumulate encoder movement until we hit a detent threshold
+    static long encoderAccumulator = 0;
+
     // Process any change
     if (diff != 0) {
-        // Each physical detent is 4 encoder counts
-        // TEMP_STEP per detent means TEMP_STEP/4 per count
-        float tempChange = diff * (TEMP_STEP / 4.0);
-
-        // Update position to current position
+        encoderAccumulator += diff;
         lastEncoderPosition = newPosition;
-
-        // Adjust temperature for active setpoint
-        float& activeSetpoint = getActiveSetpoint();
-        float newTemp = activeSetpoint + tempChange;
-
-        // Clamp to valid range
-        if (newTemp < TEMP_MIN) newTemp = TEMP_MIN;
-        if (newTemp > TEMP_MAX) newTemp = TEMP_MAX;
-
-        // Only update and redraw if temperature actually changed
-        if (newTemp != activeSetpoint) {
-            activeSetpoint = newTemp;
-            Serial.printf("Encoder: %ld (diff: %ld), %s Temperature: %.1f°C\n",
-                         newPosition, diff, pillowModeActive ? "Pillow" : "Bed", activeSetpoint);
-            drawTemperatureUI();
-
-            // Schedule debounced FreeSleep API update
-            lastSetpointChangeTime = millis();
-            pendingFreeSleepUpdate = true;
-        }
-
-        // Always record activity on any encoder movement
         recordActivity();
+
+        // Each physical detent is 4 encoder counts
+        // Change temperature when we accumulate enough for one step
+        if (abs(encoderAccumulator) >= 4) {
+            int steps = encoderAccumulator / 4;
+            encoderAccumulator = encoderAccumulator % 4;  // Keep remainder
+
+            // Step size: 0.5°C in Celsius mode, ~0.56°C (1°F) in Fahrenheit mode
+            // Internal storage is always Celsius
+            float stepSize = useFahrenheit ? (5.0f / 9.0f) : 0.5f;  // 1°F = 5/9°C ≈ 0.556°C
+            float tempChange = steps * stepSize;
+
+            // Adjust temperature for active setpoint
+            float& activeSetpoint = getActiveSetpoint();
+            float newTemp = activeSetpoint + tempChange;
+
+            // Clamp to valid range
+            if (newTemp < TEMP_MIN) newTemp = TEMP_MIN;
+            if (newTemp > TEMP_MAX) newTemp = TEMP_MAX;
+
+            // Round to step size for clean display
+            if (useFahrenheit) {
+                // Round to nearest 1°F (convert to F, round, convert back)
+                float tempF = celsiusToFahrenheit(newTemp);
+                tempF = round(tempF);
+                newTemp = fahrenheitToCelsius(tempF);
+            } else {
+                // Round to nearest 0.5°C
+                newTemp = round(newTemp * 2.0f) / 2.0f;
+            }
+
+            // Only update and redraw if temperature actually changed
+            if (newTemp != activeSetpoint) {
+                activeSetpoint = newTemp;
+                if (useFahrenheit) {
+                    Serial.printf("Encoder: %s Temperature: %.0f°F\n",
+                                 pillowModeActive ? "Pillow" : "Bed", celsiusToFahrenheit(activeSetpoint));
+                } else {
+                    Serial.printf("Encoder: %s Temperature: %.1f°C\n",
+                                 pillowModeActive ? "Pillow" : "Bed", activeSetpoint);
+                }
+                drawTemperatureUI();
+
+                // Schedule debounced FreeSleep API update
+                lastSetpointChangeTime = millis();
+                pendingFreeSleepUpdate = true;
+            }
+        }
     }
 
     // Handle encoder button press (reset to default)
@@ -889,16 +922,21 @@ void drawTemperatureUI() {
     // Use a large font size for modern look
     sprite.setFont(&fonts::FreeSansBold24pt7b);
     char tempStr[10];
-    snprintf(tempStr, sizeof(tempStr), "%.1f", activeTemp);
+    if (useFahrenheit) {
+        float tempF = celsiusToFahrenheit(activeTemp);
+        snprintf(tempStr, sizeof(tempStr), "%.0f", tempF);
+    } else {
+        snprintf(tempStr, sizeof(tempStr), "%.1f", activeTemp);
+    }
     sprite.drawString(tempStr, centerX, centerY - 10);
 
     // Draw degree symbol manually as a small circle
     sprite.fillCircle(centerX + 10, centerY + 25, 3, activePowerOn ? textColor : arcBgColor);
     sprite.fillCircle(centerX + 10, centerY + 25, 2, bgColor);
 
-    // Celsius symbol in smaller font
+    // Temperature unit symbol in smaller font
     sprite.setFont(&fonts::FreeSans12pt7b);
-    sprite.drawString("C", centerX + 25, centerY + 35);
+    sprite.drawString(useFahrenheit ? "F" : "C", centerX + 25, centerY + 35);
 
     // Draw "OFF" indicator if power is off
     if (!activePowerOn) {
@@ -915,14 +953,16 @@ void drawTemperatureUI() {
     int minX = centerX + cos(minRad) * (arcRadius + 35);
     int minY = centerY + sin(minRad) * (arcRadius + 35);
     sprite.setTextColor(minColor);
-    sprite.drawString(String((int)TEMP_MIN).c_str(), minX, minY);
+    int minDisplay = useFahrenheit ? (int)celsiusToFahrenheit(TEMP_MIN) : (int)TEMP_MIN;
+    sprite.drawString(String(minDisplay).c_str(), minX, minY);
 
     // Max label at end angle (4 o'clock position)
     float maxRad = (endAngle % 360) * PI / 180.0;
     int maxX = centerX + cos(maxRad) * (arcRadius + 35);
     int maxY = centerY + sin(maxRad) * (arcRadius + 35);
     sprite.setTextColor(maxColor);
-    sprite.drawString(String((int)TEMP_MAX).c_str(), maxX, maxY);
+    int maxDisplay = useFahrenheit ? (int)celsiusToFahrenheit(TEMP_MAX) : (int)TEMP_MAX;
+    sprite.drawString(String(maxDisplay).c_str(), maxX, maxY);
 
     // Draw time and IP address at the bottom
     sprite.setFont(&fonts::Font0);  // Small built-in font
@@ -1040,6 +1080,9 @@ void drawSettingsMenu() {
                     break;
                 case MENU_BED_SIDE:
                     value = bedSideRight ? "Right" : "Left";
+                    break;
+                case MENU_TEMP_UNIT:
+                    value = useFahrenheit ? "Fahrenheit" : "Celsius";
                     break;
                 case MENU_NIGHT_MODE:
                     value = nightModeOverride ? "Override ON" : "Auto";
@@ -1280,6 +1323,7 @@ String getMenuItemName(MenuItem item) {
         case MENU_BED_IP: return "Bed Controller IP";
         case MENU_PILLOW_IP: return "Pillow Controller IP";
         case MENU_BED_SIDE: return "Bed Side";
+        case MENU_TEMP_UNIT: return "Temperature Unit";
         case MENU_NIGHT_MODE: return "Night Mode";
         case MENU_TEMPERATURE_MODE: return "Temperature Mode";
         default: return "Unknown";
@@ -1328,6 +1372,13 @@ void handleEncoderInSettings() {
                 bedSideRight = !bedSideRight;
                 preferences.putBool("bedSideRight", bedSideRight);
                 Serial.printf("Bed side: %s (saved)\n", bedSideRight ? "Right" : "Left");
+                drawSettingsMenu();
+                break;
+            case MENU_TEMP_UNIT:
+                // Toggle temperature unit (Celsius/Fahrenheit)
+                useFahrenheit = !useFahrenheit;
+                preferences.putBool("useFahrenheit", useFahrenheit);
+                Serial.printf("Temp unit: %s (saved)\n", useFahrenheit ? "Fahrenheit" : "Celsius");
                 drawSettingsMenu();
                 break;
             case MENU_NIGHT_MODE:

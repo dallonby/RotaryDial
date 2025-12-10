@@ -2,13 +2,20 @@
 
 A beautiful, intuitive temperature controller for [FreeSleep](https://github.com/throwaway31265/free-sleep) bed temperature systems, built on the M5Stack Dial (ESP32-S3). Control your bed and pillow temperatures with a rotary dial interface featuring a colorful arc display, automatic night mode, and full FreeSleep API integration.
 
+<p align="center">
+  <img src="docs/images/day-mode.jpg" width="250" alt="Day Mode">
+  <img src="docs/images/night-mode.jpg" width="250" alt="Night Mode">
+  <img src="docs/images/settings-menu.jpg" width="250" alt="Settings Menu">
+</p>
+
 ## Features
 
 ### Temperature Control
 - **Dual Zone Control**: Independent temperature setpoints for bed and pillow zones
-- **Rotary Dial Interface**: Smooth 0.5°C increments with tactile feedback
+- **Rotary Dial Interface**: Smooth increments (0.5°C or 1°F per detent)
+- **Temperature Units**: Toggle between Celsius and Fahrenheit display
 - **Touch Arc Control**: Tap anywhere on the temperature arc to jump to that temperature
-- **Temperature Range**: 10°C to 35°C (converted to 55-110°F for FreeSleep API)
+- **Temperature Range**: 10°C to 35°C (50°F to 95°F)
 - **Visual Temperature Arc**: Color-coded gradient from blue (cold) through green/yellow to red (hot)
 - **Setpoint Indicators**: Outer marker for bed, inner marker for pillow - filled when active, outlined when inactive
 
@@ -50,6 +57,7 @@ All configuration is saved to non-volatile storage (NVS) and persists across reb
 - Bed and pillow controller IP addresses
 - WiFi credentials (when configured via on-device menu)
 - Bed side preference (Left/Right)
+- Temperature unit preference (Celsius/Fahrenheit)
 
 ## Hardware Requirements
 
@@ -80,7 +88,7 @@ brew install platformio
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/RotaryDial.git
+git clone https://github.com/dallonby/RotaryDial.git
 cd RotaryDial
 ```
 
@@ -189,6 +197,7 @@ Access by tapping the time/IP area at the bottom of the main screen.
 | **Bed Controller IP** | IP address of your bed FreeSleep server |
 | **Pillow Controller IP** | IP address of your pillow FreeSleep server |
 | **Bed Side** | Toggle between Left/Right side of the bed |
+| **Temperature Unit** | Toggle between Celsius and Fahrenheit display |
 | **Night Mode** | Shows current status (Auto/Override ON) - tap to toggle |
 | **Temperature Mode** | Shows current mode (Bed/Pillow) - tap to toggle |
 
