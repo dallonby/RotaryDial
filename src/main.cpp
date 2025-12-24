@@ -41,10 +41,26 @@ unsigned long lastSetpointChangeTime = 0;
 bool pendingFreeSleepUpdate = false;
 const unsigned long FREESLEEP_DEBOUNCE_MS = 500;  // Wait 500ms after last change before sending
 
+// Periodic sync from FreeSleep API
+unsigned long lastFreeSleepSync = 0;
+const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 30000;  // Sync every 30 seconds
+
+// Track night mode state to detect changes
+bool wasNightMode = false;
+
 // Touch duration tracking for center tap
 unsigned long centerTouchStartTime = 0;
+unsigned long lastCenterTapTime = 0;
 bool centerTouchActive = false;
-const unsigned long LONG_PRESS_MS = 500;  // 500ms threshold for long press
+// Touch duration thresholds:
+// < 200ms: wake/brightness only
+// 200-1000ms: power toggle
+// 1000-3000ms: night mode toggle
+// > 3000ms: open settings menu
+const unsigned long TAP_MIN_MS = 200;
+const unsigned long POWER_MAX_MS = 1000;
+const unsigned long NIGHT_MODE_MAX_MS = 3000;
+const unsigned long TAP_DEBOUNCE_MS = 500;  // Minimum time between taps
 
 // Menu navigation
 enum MenuItem {
@@ -144,6 +160,7 @@ bool fetchFreeSleepTemperature(IPAddress ip, const char* side, float& tempCelsiu
 bool setFreeSleepTemperature(IPAddress ip, const char* side, float tempCelsius);
 bool setFreeSleepPower(IPAddress ip, const char* side, bool powerOn);
 void syncTemperaturesFromFreeSleep();
+void syncFromFreeSleep();
 void toggleActivePower();
 
 void setup() {
@@ -221,6 +238,9 @@ void setup() {
     lastActivityTime = millis();
     recordActivity();
 
+    // Initialize night mode state
+    wasNightMode = isNightTime();
+
     // Draw initial UI
     drawTemperatureUI();
 }
@@ -257,6 +277,23 @@ void loop() {
             setFreeSleepTemperature(pillowTargetIP, side, pillowSetpoint);
         } else {
             setFreeSleepTemperature(bedTargetIP, side, bedSetpoint);
+        }
+    }
+
+    // Periodic sync from FreeSleep (temperature and power state)
+    if (wifiConnected && !inSettingsMenu && !pendingFreeSleepUpdate &&
+        (currentMillis - lastFreeSleepSync >= FREESLEEP_SYNC_INTERVAL_MS)) {
+        lastFreeSleepSync = currentMillis;
+        syncFromFreeSleep();
+    }
+
+    // Check for night mode changes (independent of FreeSleep sync)
+    if (!inSettingsMenu) {
+        bool currentNightMode = isNightTime();
+        if (currentNightMode != wasNightMode) {
+            wasNightMode = currentNightMode;
+            Serial.printf("Night mode changed to: %s\n", currentNightMode ? "ON" : "OFF");
+            drawTemperatureUI();
         }
     }
 
@@ -669,7 +706,15 @@ void handleTouchInput() {
 
     // Track touch on center area for duration-based actions
     if (touch.wasPressed()) {
-        recordActivity();
+        // Check if this is a center touch - don't call recordActivity yet
+        // (we handle wake/dim toggle explicitly on release)
+        bool isCenterTouch = !inSettingsMenu &&
+                             abs(touch.x - centerX) < 60 &&
+                             abs(touch.y - centerY) < 60;
+
+        if (!isCenterTouch) {
+            recordActivity();
+        }
 
         // If in settings menu or submenus, handle touch to exit
         if (inSettingsMenu) {
@@ -783,16 +828,46 @@ void handleTouchInput() {
     // Handle touch release for center area (duration-based actions)
     if (touch.wasReleased() && centerTouchActive) {
         centerTouchActive = false;
-        unsigned long touchDuration = millis() - centerTouchStartTime;
+        unsigned long now = millis();
+        unsigned long touchDuration = now - centerTouchStartTime;
 
-        if (touchDuration >= LONG_PRESS_MS) {
-            // Long press: Toggle night mode override
+        // Debounce: ignore taps that come too quickly after the last one
+        if (now - lastCenterTapTime < TAP_DEBOUNCE_MS) {
+            Serial.println("Tap ignored (debounce)");
+            return;
+        }
+        lastCenterTapTime = now;
+
+        if (touchDuration < TAP_MIN_MS) {
+            // Very short tap: toggle between wake and sleep brightness
+            if (isDimmed) {
+                // Wake up
+                isDimmed = false;
+                lastActivityTime = millis();
+                Serial.println("Quick tap - waking up");
+            } else {
+                // Force dim
+                isDimmed = true;
+                lastActivityTime = 0;  // Set to long ago so it stays dimmed
+                Serial.println("Quick tap - dimming");
+            }
+            updateBrightness();
+        } else if (touchDuration < POWER_MAX_MS) {
+            // 200-1000ms: Toggle power for active mode (bed or pillow)
+            Serial.printf("Power toggle tap (%lums)\n", touchDuration);
+            toggleActivePower();
+        } else if (touchDuration < NIGHT_MODE_MAX_MS) {
+            // 1000-3000ms: Toggle night mode override
             nightModeOverride = !nightModeOverride;
-            Serial.printf("Night mode override: %s\n", nightModeOverride ? "ON" : "OFF");
+            Serial.printf("Night mode override: %s (%lums)\n", nightModeOverride ? "ON" : "OFF", touchDuration);
             drawTemperatureUI();
         } else {
-            // Short press: Toggle power for active mode (bed or pillow)
-            toggleActivePower();
+            // > 3000ms: Open settings menu
+            Serial.printf("Long hold - opening menu (%lums)\n", touchDuration);
+            inSettingsMenu = true;
+            currentMenuItem = MENU_WIFI_SETTINGS;
+            currentSubMenu = SUBMENU_NONE;
+            drawSettingsMenu();
         }
     }
 }
@@ -2007,5 +2082,47 @@ void syncTemperaturesFromFreeSleep() {
         pillowSetpoint = temp;
         pillowPowerOn = isOn;
         Serial.printf("Pillow synced: %.1f°C, power: %s\n", pillowSetpoint, pillowPowerOn ? "ON" : "OFF");
+    }
+}
+
+// Periodic sync of temperature and power state from FreeSleep
+void syncFromFreeSleep() {
+    float temp;
+    bool isOn;
+    bool needsRedraw = false;
+
+    const char* side = bedSideRight ? "right" : "left";
+
+    // Fetch bed temperature and power state
+    if (fetchFreeSleepTemperature(bedTargetIP, side, temp, isOn)) {
+        if (bedPowerOn != isOn) {
+            bedPowerOn = isOn;
+            Serial.printf("Bed power state changed: %s\n", bedPowerOn ? "ON" : "OFF");
+            needsRedraw = true;
+        }
+        if (abs(bedSetpoint - temp) > 0.1f) {
+            bedSetpoint = temp;
+            Serial.printf("Bed temperature synced: %.1f°C\n", bedSetpoint);
+            needsRedraw = true;
+        }
+    }
+
+    // Fetch pillow temperature and power state
+    if (fetchFreeSleepTemperature(pillowTargetIP, side, temp, isOn)) {
+        if (pillowPowerOn != isOn) {
+            pillowPowerOn = isOn;
+            Serial.printf("Pillow power state changed: %s\n", pillowPowerOn ? "ON" : "OFF");
+            needsRedraw = true;
+        }
+        if (abs(pillowSetpoint - temp) > 0.1f) {
+            pillowSetpoint = temp;
+            Serial.printf("Pillow temperature synced: %.1f°C\n", pillowSetpoint);
+            needsRedraw = true;
+        }
+    }
+
+    // Only redraw if something actually changed
+    if (needsRedraw) {
+        drawTemperatureUI();
     }
 }
