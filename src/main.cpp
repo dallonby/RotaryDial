@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <time.h>
+#include <WiFiClient.h>
 #include "config.h"
 
 Preferences preferences;
@@ -48,6 +49,7 @@ const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 2000;  // Sync every 2 seconds 
 unsigned long currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
 const unsigned long MAX_SYNC_INTERVAL_MS = 60000;  // Max backoff of 60 seconds
 int consecutiveFailures = 0;
+bool skipUserUpdates = false;  // Skip user-initiated updates when failing
 
 // Track night mode state to detect changes
 bool wasNightMode = false;
@@ -230,10 +232,9 @@ void setup() {
     // Setup NTP time sync
     setupNTP();
 
-    // Sync temperatures from FreeSleep API
-    if (wifiConnected) {
-        syncTemperaturesFromFreeSleep();
-    }
+    // Don't sync temperatures at startup - let the periodic sync handle it
+    // This prevents blocking the UI if IPs are unreachable
+    // Initial sync will happen within 2 seconds via the main loop
 
     // Get initial encoder position
     lastEncoderPosition = M5Dial.Encoder.read();
@@ -276,11 +277,16 @@ void loop() {
     // Handle debounced FreeSleep API updates
     if (pendingFreeSleepUpdate && (currentMillis - lastSetpointChangeTime >= FREESLEEP_DEBOUNCE_MS)) {
         pendingFreeSleepUpdate = false;
-        const char* side = bedSideRight ? "right" : "left";
-        if (pillowModeActive) {
-            setFreeSleepTemperature(pillowTargetIP, side, pillowSetpoint);
+        // Skip updates if we've had consecutive failures (pods unreachable)
+        if (!skipUserUpdates) {
+            const char* side = bedSideRight ? "right" : "left";
+            if (pillowModeActive) {
+                setFreeSleepTemperature(pillowTargetIP, side, pillowSetpoint);
+            } else {
+                setFreeSleepTemperature(bedTargetIP, side, bedSetpoint);
+            }
         } else {
-            setFreeSleepTemperature(bedTargetIP, side, bedSetpoint);
+            Serial.println("Skipping user update - pods unreachable");
         }
     }
 
@@ -311,6 +317,16 @@ void setupWiFi() {
     const char* password = savedWifiPassword.length() > 0 ? savedWifiPassword.c_str() : WIFI_PASSWORD;
 
     Serial.printf("Connecting to WiFi: %s\n", ssid);
+
+    // Configure static IP to avoid any DHCP conflicts
+    IPAddress local_IP(192, 168, 1, 250);
+    IPAddress gateway(192, 168, 1, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    IPAddress primaryDNS(8, 8, 8, 8);
+
+    if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+        Serial.println("Static IP configuration failed");
+    }
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
@@ -413,6 +429,82 @@ void setupWebServer() {
         }
         server.send(400, "application/json", "{\"error\":\"Invalid IP address\"}");
     });
+
+    // Debug endpoint to test FreeSleep connection
+    server.on("/api/debug/test-freesleep", HTTP_GET, []() {
+        const char* side = bedSideRight ? "right" : "left";
+
+        // Test bed connection
+        HTTPClient httpBed;
+        String bedUrl = "http://" + bedTargetIP.toString() + ":3000/api/deviceStatus";
+        httpBed.begin(bedUrl);
+        httpBed.addHeader("Content-Type", "application/json");
+        httpBed.setTimeout(2000);
+        httpBed.setConnectTimeout(2000);
+        int tempF = (int)round(celsiusToFahrenheit(bedSetpoint));
+        JsonDocument docBed;
+        docBed[side]["targetTemperatureF"] = tempF;
+        String payloadBed;
+        serializeJson(docBed, payloadBed);
+        int bedCode = httpBed.POST(payloadBed);
+        httpBed.end();
+
+        // Test pillow connection
+        HTTPClient httpPillow;
+        String pillowUrl = "http://" + pillowTargetIP.toString() + ":3000/api/deviceStatus";
+        httpPillow.begin(pillowUrl);
+        httpPillow.addHeader("Content-Type", "application/json");
+        httpPillow.setTimeout(2000);
+        httpPillow.setConnectTimeout(2000);
+        tempF = (int)round(celsiusToFahrenheit(pillowSetpoint));
+        JsonDocument docPillow;
+        docPillow[side]["targetTemperatureF"] = tempF;
+        String payloadPillow;
+        serializeJson(docPillow, payloadPillow);
+        int pillowCode = httpPillow.POST(payloadPillow);
+        httpPillow.end();
+
+        String response = "{";
+        response += "\"bedIP\":\"" + bedTargetIP.toString() + "\",";
+        response += "\"pillowIP\":\"" + pillowTargetIP.toString() + "\",";
+        response += "\"side\":\"" + String(side) + "\",";
+        response += "\"bedSetpoint\":" + String(bedSetpoint) + ",";
+        response += "\"pillowSetpoint\":" + String(pillowSetpoint) + ",";
+        response += "\"bedHttpCode\":" + String(bedCode) + ",";
+        response += "\"pillowHttpCode\":" + String(pillowCode) + ",";
+        response += "\"bedSuccess\":" + String((bedCode == 204 || bedCode == 200) ? "true" : "false") + ",";
+        response += "\"pillowSuccess\":" + String((pillowCode == 204 || pillowCode == 200) ? "true" : "false");
+        response += "}";
+
+        server.send(200, "application/json", response);
+    });
+
+    // Update WiFi credentials
+    server.on("/api/config/wifi", HTTP_POST, []() {
+        if (server.hasArg("plain")) {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+            if (!error && doc.containsKey("ssid") && doc.containsKey("password")) {
+                String newSSID = doc["ssid"].as<String>();
+                String newPassword = doc["password"].as<String>();
+
+                preferences.begin("tempctrl", false);
+                preferences.putString("wifiSSID", newSSID);
+                preferences.putString("wifiPass", newPassword);
+                preferences.end();
+
+                savedWifiSSID = newSSID;
+                savedWifiPassword = newPassword;
+
+                Serial.printf("WiFi credentials updated: %s\n", newSSID.c_str());
+                server.send(200, "application/json", "{\"success\":true,\"message\":\"WiFi updated, reboot required\"}");
+                return;
+            }
+        }
+        server.send(400, "application/json", "{\"error\":\"Invalid request\"}");
+    });
+
     server.onNotFound(handleNotFound);
 
     server.begin();
@@ -686,6 +778,10 @@ void handleEncoderInput() {
                 drawTemperatureUI();
 
                 // Schedule debounced FreeSleep API update
+                // Reset failfast on user interaction - they want to try again
+                skipUserUpdates = false;
+                consecutiveFailures = 0;
+                currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
                 lastSetpointChangeTime = millis();
                 pendingFreeSleepUpdate = true;
             }
@@ -701,6 +797,10 @@ void handleEncoderInput() {
         drawTemperatureUI();
 
         // Schedule debounced FreeSleep API update
+        // Reset failfast on user interaction - they want to try again
+        skipUserUpdates = false;
+        consecutiveFailures = 0;
+        currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
         lastSetpointChangeTime = millis();
         pendingFreeSleepUpdate = true;
     }
@@ -824,6 +924,10 @@ void handleTouchInput() {
             drawTemperatureUI();
 
             // Schedule debounced FreeSleep API update
+            // Reset failfast on user interaction - they want to try again
+            skipUserUpdates = false;
+            consecutiveFailures = 0;
+            currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
             lastSetpointChangeTime = millis();
             pendingFreeSleepUpdate = true;
         }
@@ -1942,7 +2046,8 @@ bool fetchFreeSleepTemperature(IPAddress ip, const char* side, float& tempCelsiu
     String url = "http://" + ip.toString() + ":3000/api/deviceStatus";
 
     http.begin(url);
-    http.setTimeout(1000);  // 1 second timeout for local network
+    http.setTimeout(2000);  // 5 second timeout to debug
+    http.setConnectTimeout(2000);  // 5 second connection timeout to debug
 
     int httpCode = http.GET();
 
@@ -1980,7 +2085,8 @@ bool setFreeSleepTemperature(IPAddress ip, const char* side, float tempCelsius) 
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(1000);  // 1 second timeout for local network
+    http.setTimeout(2000);  // 5 second timeout to debug
+    http.setConnectTimeout(2000);  // 5 second connection timeout to debug
 
     // Convert to Fahrenheit and round to integer (API requires integer)
     int tempF = (int)round(celsiusToFahrenheit(tempCelsius));
@@ -2022,7 +2128,8 @@ bool setFreeSleepPower(IPAddress ip, const char* side, bool powerOn) {
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(1000);  // 1 second timeout for local network
+    http.setTimeout(2000);  // 5 second timeout to debug
+    http.setConnectTimeout(2000);  // 5 second connection timeout to debug
 
     // Build JSON payload
     JsonDocument doc;
@@ -2139,6 +2246,7 @@ void syncFromFreeSleep() {
             Serial.printf("FreeSleep sync recovered after %d failures\n", consecutiveFailures);
             consecutiveFailures = 0;
             currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
+            skipUserUpdates = false;  // Re-enable user updates
         }
     } else {
         // Exponential backoff on failure
@@ -2146,6 +2254,10 @@ void syncFromFreeSleep() {
         currentSyncInterval = min(currentSyncInterval * 2, MAX_SYNC_INTERVAL_MS);
         Serial.printf("FreeSleep sync failed (%d consecutive), backing off to %lums\n",
                      consecutiveFailures, currentSyncInterval);
+        // After 3 failures, stop trying to send user updates (prevents blocking)
+        if (consecutiveFailures >= 3) {
+            skipUserUpdates = true;
+        }
     }
 
     // Only redraw if something actually changed
