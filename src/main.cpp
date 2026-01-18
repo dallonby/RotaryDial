@@ -43,7 +43,7 @@ const unsigned long FREESLEEP_DEBOUNCE_MS = 500;  // Wait 500ms after last chang
 
 // Periodic sync from FreeSleep API
 unsigned long lastFreeSleepSync = 0;
-const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 30000;  // Sync every 30 seconds
+const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 2000;  // Sync every 2 seconds
 
 // Track night mode state to detect changes
 bool wasNightMode = false;
@@ -100,8 +100,8 @@ int passwordCharIndex = 0;  // Current character being edited
 const char alphaNumeric[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:',.<>?/ ";
 
 // Target IP addresses for bed and pillow controllers
-IPAddress bedTargetIP(192, 168, 1, 1);     // Default bed controller IP
-IPAddress pillowTargetIP(192, 168, 1, 1);  // Default pillow controller IP
+IPAddress bedTargetIP(192, 168, 1, 44);     // Default bed controller IP
+IPAddress pillowTargetIP(192, 168, 1, 14);  // Default pillow controller IP
 
 // Web server
 WebServer server(API_PORT);
@@ -1937,7 +1937,7 @@ bool fetchFreeSleepTemperature(IPAddress ip, const char* side, float& tempCelsiu
     String url = "http://" + ip.toString() + ":3000/api/deviceStatus";
 
     http.begin(url);
-    http.setTimeout(5000);
+    http.setTimeout(1000);  // 1 second timeout for local network
 
     int httpCode = http.GET();
 
@@ -1975,7 +1975,7 @@ bool setFreeSleepTemperature(IPAddress ip, const char* side, float tempCelsius) 
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(5000);
+    http.setTimeout(1000);  // 1 second timeout for local network
 
     // Convert to Fahrenheit and round to integer (API requires integer)
     int tempF = (int)round(celsiusToFahrenheit(tempCelsius));
@@ -2017,7 +2017,7 @@ bool setFreeSleepPower(IPAddress ip, const char* side, bool powerOn) {
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(5000);
+    http.setTimeout(1000);  // 1 second timeout for local network
 
     // Build JSON payload
     JsonDocument doc;
