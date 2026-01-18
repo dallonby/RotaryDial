@@ -40,10 +40,14 @@ bool pillowPowerOn = true;   // Assume on until we fetch status
 unsigned long lastSetpointChangeTime = 0;
 bool pendingFreeSleepUpdate = false;
 const unsigned long FREESLEEP_DEBOUNCE_MS = 500;  // Wait 500ms after last change before sending
+const unsigned long SYNC_COOLDOWN_AFTER_CHANGE_MS = 1000;  // Don't sync from pod for 1s after user changes
 
-// Periodic sync from FreeSleep API
+// Periodic sync from FreeSleep API with exponential backoff
 unsigned long lastFreeSleepSync = 0;
-const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 2000;  // Sync every 2 seconds
+const unsigned long FREESLEEP_SYNC_INTERVAL_MS = 2000;  // Sync every 2 seconds when successful
+unsigned long currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
+const unsigned long MAX_SYNC_INTERVAL_MS = 60000;  // Max backoff of 60 seconds
+int consecutiveFailures = 0;
 
 // Track night mode state to detect changes
 bool wasNightMode = false;
@@ -281,8 +285,9 @@ void loop() {
     }
 
     // Periodic sync from FreeSleep (temperature and power state)
+    // Uses exponential backoff when failing to prevent UI freezing
     if (wifiConnected && !inSettingsMenu && !pendingFreeSleepUpdate &&
-        (currentMillis - lastFreeSleepSync >= FREESLEEP_SYNC_INTERVAL_MS)) {
+        (currentMillis - lastFreeSleepSync >= currentSyncInterval)) {
         lastFreeSleepSync = currentMillis;
         syncFromFreeSleep();
     }
@@ -2090,17 +2095,22 @@ void syncFromFreeSleep() {
     float temp;
     bool isOn;
     bool needsRedraw = false;
+    bool anySuccess = false;
+
+    // Don't sync temperature if user recently changed it (prevents overwriting user input)
+    bool allowTempSync = (millis() - lastSetpointChangeTime) > SYNC_COOLDOWN_AFTER_CHANGE_MS;
 
     const char* side = bedSideRight ? "right" : "left";
 
     // Fetch bed temperature and power state
     if (fetchFreeSleepTemperature(bedTargetIP, side, temp, isOn)) {
+        anySuccess = true;
         if (bedPowerOn != isOn) {
             bedPowerOn = isOn;
             Serial.printf("Bed power state changed: %s\n", bedPowerOn ? "ON" : "OFF");
             needsRedraw = true;
         }
-        if (abs(bedSetpoint - temp) > 0.1f) {
+        if (allowTempSync && abs(bedSetpoint - temp) > 0.1f) {
             bedSetpoint = temp;
             Serial.printf("Bed temperature synced: %.1f°C\n", bedSetpoint);
             needsRedraw = true;
@@ -2109,16 +2119,33 @@ void syncFromFreeSleep() {
 
     // Fetch pillow temperature and power state
     if (fetchFreeSleepTemperature(pillowTargetIP, side, temp, isOn)) {
+        anySuccess = true;
         if (pillowPowerOn != isOn) {
             pillowPowerOn = isOn;
             Serial.printf("Pillow power state changed: %s\n", pillowPowerOn ? "ON" : "OFF");
             needsRedraw = true;
         }
-        if (abs(pillowSetpoint - temp) > 0.1f) {
+        if (allowTempSync && abs(pillowSetpoint - temp) > 0.1f) {
             pillowSetpoint = temp;
             Serial.printf("Pillow temperature synced: %.1f°C\n", pillowSetpoint);
             needsRedraw = true;
         }
+    }
+
+    // Handle backoff logic
+    if (anySuccess) {
+        // Reset on success
+        if (consecutiveFailures > 0) {
+            Serial.printf("FreeSleep sync recovered after %d failures\n", consecutiveFailures);
+            consecutiveFailures = 0;
+            currentSyncInterval = FREESLEEP_SYNC_INTERVAL_MS;
+        }
+    } else {
+        // Exponential backoff on failure
+        consecutiveFailures++;
+        currentSyncInterval = min(currentSyncInterval * 2, MAX_SYNC_INTERVAL_MS);
+        Serial.printf("FreeSleep sync failed (%d consecutive), backing off to %lums\n",
+                     consecutiveFailures, currentSyncInterval);
     }
 
     // Only redraw if something actually changed
